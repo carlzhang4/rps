@@ -10,4 +10,4 @@ aux_source_directory(src SRCS)
 
 add_executable(main ${SRCS} main.cpp)
 
-target_link_libraries(main lz4 r)
+target_link_libraries(main lz4 r pthread)
