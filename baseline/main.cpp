@@ -148,12 +148,10 @@ void sub_task_server(int thread_index, QpHandler* handler, void* buf, void* veri
 			LOG_E("Server thread [%d] verify buf failed, index:[%d]",thread_index,i);
 			break;
 		}
-		if(i==num_chunck-1){
-			LOG_I("Server thread [%d] verify buf success",thread_index);
-		}
 	}
 	double duration = end_timer.tv_sec-start_timer.tv_sec+1.0*(end_timer.tv_nsec-start_timer.tv_nsec)/1e9;
 	std::lock_guard<std::mutex> guard(IO_LOCK);
+	LOG_I("Server thread [%d] verify buf success",thread_index);
 	LOG_I("Thread : %d, running on CPU : %d",thread_index,sched_getcpu());
 	LOG_I("Time : %.3f s",duration);
 	LOG_I("Speed : %.2f Gb/s",8.0*ops*chunck_size/1024/1024/1024/duration);
