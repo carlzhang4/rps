@@ -4,6 +4,7 @@
 #include <lz4.h>
 #include <assert.h>
 #include <algorithm>
+#include <gflags/gflags.h>
 #include "libr.hpp"
 
 using namespace std;
@@ -30,8 +31,8 @@ int decompress(char* compressed_str, char* decompressed_str, int compressed_size
 	return decompressed_size;
 }
 
-int init_bufs(int node_id, void** bufs, void* verify_buf, int* compressed_lengths, int num_threads, size_t buf_size, int chunck_size){
-	LOG_I("Init buf size : %ld, total threads : %d", buf_size, num_threads);
+int init_bufs(int node_id, void** bufs, void* verify_buf, int* compressed_lengths, int num_threads, size_t buf_size, int chunck_size, int is_server_processing, string file_name){
+	LOG_I("[Start Init Buffer] size : %ld, total threads : %d", buf_size, num_threads);
 	for(int i=0;i<num_threads;i++){
 		bufs[i] = myMalloc2MbPage(buf_size);
 		if(node_id == 0){
@@ -41,13 +42,13 @@ int init_bufs(int node_id, void** bufs, void* verify_buf, int* compressed_length
 		}
 	}
 	int num_chunck = 0;
-	
-	ifstream ifs( "../../dataset/silesia/dickens", ifstream::binary);
+	ifstream ifs(file_name, ifstream::binary);
 	assert(ifs.is_open());
 	ifs.seekg(0,ifs.end);
 	int file_size = ifs.tellg();
 	assert(file_size<=(buf_size/2));//buf is split into send/recv
 	num_chunck = (file_size+chunck_size-1)/chunck_size;
+	LOG_I("%-20s : %s","File name",file_name.c_str());
 	LOG_I("%-20s : %d","File size",file_size);
 	LOG_I("%-20s : %d","Num chunck",num_chunck);
 	LOG_I("%-20s : %d","Chunck Size",chunck_size);
@@ -64,17 +65,24 @@ int init_bufs(int node_id, void** bufs, void* verify_buf, int* compressed_length
 		for(int i=0;i<num_threads;i++){
 			memcpy(bufs[i], (void*)data, file_size);
 		}
-		for(int i=0;i<num_chunck;i++){
-			int compressed_size = compress(data+i*chunck_size, ((char*)verify_buf)+i*chunck_size, chunck_size);
-			compressed_lengths[i] = compressed_size;
-		}
+		if(is_server_processing){
+			for(int i=0;i<num_chunck;i++){
+				int compressed_size = compress(data+i*chunck_size, ((char*)verify_buf)+i*chunck_size, chunck_size);
+				compressed_lengths[i] = compressed_size;
+			}
+		}else{
+			memcpy(verify_buf, (void*)data, file_size);
+			for(int i=0;i<num_chunck;i++){
+				compressed_lengths[i] = chunck_size;
+			}
+		}	
 	}else{
 		memcpy(verify_buf, (void*)data, file_size);
 	}
-	LOG_I("Init buf done");
+	LOG_I("[Init buf done]");
 	return num_chunck;
 }
-void sub_task_server(int thread_index, QpHandler* handler, void* buf, void* verify_buf, size_t buf_size, int num_chunck, int chunck_size, size_t ops){
+void sub_task_server(int thread_index, QpHandler* handler, void* buf, void* verify_buf, size_t buf_size, int num_chunck, int chunck_size, size_t ops, int is_server_processing){
 	int ne_send;
 	int ne_recv;
 	struct ibv_wc *wc_send = NULL;
@@ -109,21 +117,28 @@ void sub_task_server(int thread_index, QpHandler* handler, void* buf, void* veri
 			}
 			assert(wc_recv[i].status == IBV_WC_SUCCESS);
 			size_t offset =  (cur_recv_complete%num_chunck)*chunck_size;
-			int compressed_size = compress((char*)buf+buf_size/2+offset, (char*)buf+offset,chunck_size);
-			compressed_lengths[cur_recv_complete%num_chunck] = compressed_size;
+			if(is_server_processing){
+				int compressed_size = compress((char*)buf+buf_size/2+offset, (char*)buf+offset,chunck_size);
+				compressed_lengths[cur_recv_complete%num_chunck] = compressed_size;
+			}else{
+				memcpy((char*)buf+offset, (char*)buf+buf_size/2+offset, chunck_size);
+				compressed_lengths[cur_recv_complete%num_chunck] = chunck_size;
+			}	
 			cur_recv_complete+=1;
 		}
 
 		while(cur_send<cur_recv_complete && (cur_send-cur_send_complete)<handler->tx_depth && cur_send<ops){
 			size_t offset = (cur_send%num_chunck)*chunck_size;
-			int todo_compressed_chunk_size = chunck_size;
 			post_send(*handler,offset,compressed_lengths[cur_send%num_chunck]);
 			cur_send+=1;
 		}	
 		
 		ne_send = poll_send_cq(*handler,wc_send);
 		for(int i=0;i<ne_send;i++){
-			assert(wc_send[i].status == IBV_WC_SUCCESS);
+			if(wc_send[i].status != IBV_WC_SUCCESS){
+				LOG_I("Thread : %d, wc_send[%d].status = %d, i=%d",thread_index, cur_send_complete, wc_send[i].status, i);
+				assert(wc_send[i].status == IBV_WC_SUCCESS);
+			}
 			cur_send_complete+=1;
 		}
 	}
@@ -213,17 +228,18 @@ void sub_task_client(int thread_index, QpHandler* handler, void* buf, void* veri
 	LOG_I("Time : %.3f s",duration);
 	LOG_I("Speed : %.2f Gb/s",8.0*ops*chunck_size/1024/1024/1024/duration);
 }
-void compression_benchmark(NetParam &net_param, int num_threads, int iterations, int chunck_size){
+void compression_benchmark(NetParam &net_param, int num_threads, int iterations, int chunck_size, int is_server_processing, string file_name){
 	int num_cpus = thread::hardware_concurrency();
-	LOG_I("%-20s : %d","HardwareConcurrency",num_cpus);
 	assert(num_threads<=num_cpus);
+	LOG_I("%-20s : %d","Total threads",num_threads);
+	
 	
 	//init bufs and verify buf
-	size_t buf_size = 128*1024*1024;
+	size_t buf_size = 512*1024*1024;
 	void** bufs = new void*[num_threads];
 	void* verify_buf = myMalloc2MbPage(buf_size/2);
 	int* compressed_lengths = new int[buf_size/2/chunck_size];
-	int num_chunck = init_bufs(net_param.nodeId,bufs,verify_buf,compressed_lengths,num_threads,buf_size,chunck_size);
+	int num_chunck = init_bufs(net_param.nodeId,bufs,verify_buf,compressed_lengths,num_threads,buf_size,chunck_size,is_server_processing, file_name);
 	size_t ops = size_t(1) * iterations * num_chunck;
 	LOG_I("%-20s : %d","Iterations",iterations);
 	LOG_I("%-20s : %d","Ops",ops);
@@ -249,7 +265,7 @@ void compression_benchmark(NetParam &net_param, int num_threads, int iterations,
 	clock_gettime(CLOCK_MONOTONIC, &start_timer);
 	for(int i=0;i<num_threads;i++){
 		if(net_param.nodeId == 0){
-			threads[i] = thread(sub_task_server, i, qp_handlers[i], bufs[i], verify_buf, buf_size, num_chunck, chunck_size, ops);
+			threads[i] = thread(sub_task_server, i, qp_handlers[i], bufs[i], verify_buf, buf_size, num_chunck, chunck_size, ops, is_server_processing);
 		}else if(net_param.nodeId == 1){
 			threads[i] = thread(sub_task_client, i, qp_handlers[i], bufs[i], verify_buf, compressed_lengths, buf_size, num_chunck, chunck_size, ops);
 		}
@@ -263,14 +279,27 @@ void compression_benchmark(NetParam &net_param, int num_threads, int iterations,
 	LOG_I("Total Time : %.3f s",duration);
 	LOG_I("Total Speed : %.2f Gb/s",8.0*num_threads*ops*chunck_size/1024/1024/1024/duration);
 }
+DEFINE_int32(threads,0,"num_threads");
+DEFINE_int32(numNodes,0,"numNodes");
+DEFINE_int32(nodeId,0,"nodeId");
+DEFINE_string(serverIp,"","serverIp");
 int main(int argc, char *argv[]){
-	int num_threads = 48;
-	int iterations = 500;
+	gflags::ParseCommandLineFlags(&argc, &argv, true); 
+	
+	int iterations = 1000;
 	int chunck_size = 16*1024;
+	int is_server_processing = 1;
+	string file_name = "../../dataset/silesia/nci";
+	int num_threads = FLAGS_threads;
+
 	NetParam net_param;
-	get_opt(net_param,argc,argv);
+	net_param.numNodes = FLAGS_numNodes;
+	net_param.nodeId = FLAGS_nodeId;
+	net_param.serverIp = FLAGS_serverIp;
+	init_net_param(net_param);
+	
 	socket_init(net_param);
     roce_init(net_param,num_threads);
-	compression_benchmark(net_param, num_threads, iterations, chunck_size);
+	compression_benchmark(net_param, num_threads, iterations, chunck_size, is_server_processing, file_name);
     return 0;
 }
