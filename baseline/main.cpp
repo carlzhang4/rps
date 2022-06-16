@@ -48,6 +48,7 @@ int init_bufs(int node_id, void** bufs, void* verify_buf, int* compressed_length
 	int file_size = ifs.tellg();
 	assert(file_size<=(buf_size/2));//buf is split into send/recv
 	num_chunck = (file_size+chunck_size-1)/chunck_size;
+	LOG_I("%-20s : %d","IsServerProcessing",is_server_processing);
 	LOG_I("%-20s : %s","File name",file_name.c_str());
 	LOG_I("%-20s : %d","File size",file_size);
 	LOG_I("%-20s : %d","Num chunck",num_chunck);
@@ -116,19 +117,24 @@ void sub_task_server(int thread_index, QpHandler* handler, void* buf, void* veri
 				cur_recv+=1;
 			}
 			assert(wc_recv[i].status == IBV_WC_SUCCESS);
+			assert(wc_recv[i].byte_len == chunck_size);
 			size_t offset =  (cur_recv_complete%num_chunck)*chunck_size;
 			if(is_server_processing){
 				int compressed_size = compress((char*)buf+buf_size/2+offset, (char*)buf+offset,chunck_size);
 				compressed_lengths[cur_recv_complete%num_chunck] = compressed_size;
 			}else{
-				memcpy((char*)buf+offset, (char*)buf+buf_size/2+offset, chunck_size);
 				compressed_lengths[cur_recv_complete%num_chunck] = chunck_size;
 			}	
 			cur_recv_complete+=1;
 		}
 
 		while(cur_send<cur_recv_complete && (cur_send-cur_send_complete)<handler->tx_depth && cur_send<ops){
-			size_t offset = (cur_send%num_chunck)*chunck_size;
+			size_t offset;
+			if(is_server_processing){
+				offset = (cur_send%num_chunck)*chunck_size;
+			}else{
+				offset = (cur_send%num_chunck)*chunck_size + buf_size/2;//if no processing, return received data directly
+			}
 			post_send(*handler,offset,compressed_lengths[cur_send%num_chunck]);
 			cur_send+=1;
 		}	
@@ -278,17 +284,18 @@ void compression_benchmark(NetParam &net_param, int num_threads, int iterations,
 	LOG_I("Total Speed : %.2f Gb/s",8.0*num_threads*ops*chunck_size/1024/1024/1024/duration);
 }
 
-DEFINE_int32(iterations,	1000,	"iterations");
-DEFINE_int32(chunckSize,	16384,	"chunck_size");
-DEFINE_int32(threads,		0,		"num_threads");
-DEFINE_int32(numNodes,		0,		"numNodes");
-DEFINE_int32(nodeId,		0,		"nodeId");
-DEFINE_string(serverIp,		"",		"serverIp");
-DEFINE_string(fileName,		"",		"file_name");
+DEFINE_int32(iterations,			1000,	"iterations");
+DEFINE_int32(chunckSize,			16384,	"chunck_size");
+DEFINE_int32(threads,				0,		"num_threads");
+DEFINE_int32(numNodes,				0,		"numNodes");
+DEFINE_int32(nodeId,				0,		"nodeId");
+DEFINE_int32(isServerProcessing,	1,		"is_server_processing");
+DEFINE_string(serverIp,				"",		"serverIp");
+DEFINE_string(fileName,				"",		"file_name");
 int main(int argc, char *argv[]){
 	gflags::ParseCommandLineFlags(&argc, &argv, true); 
 	
-	int is_server_processing = 0;
+	int is_server_processing = FLAGS_isServerProcessing;
 	int iterations = FLAGS_iterations;
 	int chunck_size = FLAGS_chunckSize;
 	int num_threads = FLAGS_threads;
