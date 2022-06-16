@@ -277,18 +277,22 @@ void compression_benchmark(NetParam &net_param, int num_threads, int iterations,
 	LOG_I("Total Time : %.3f s",duration);
 	LOG_I("Total Speed : %.2f Gb/s",8.0*num_threads*ops*chunck_size/1024/1024/1024/duration);
 }
-DEFINE_int32(threads,0,"num_threads");
-DEFINE_int32(numNodes,0,"numNodes");
-DEFINE_int32(nodeId,0,"nodeId");
-DEFINE_string(serverIp,"","serverIp");
+
+DEFINE_int32(iterations,	1000,	"iterations");
+DEFINE_int32(chunckSize,	16384,	"chunck_size");
+DEFINE_int32(threads,		0,		"num_threads");
+DEFINE_int32(numNodes,		0,		"numNodes");
+DEFINE_int32(nodeId,		0,		"nodeId");
+DEFINE_string(serverIp,		"",		"serverIp");
+DEFINE_string(fileName,		"",		"file_name");
 int main(int argc, char *argv[]){
 	gflags::ParseCommandLineFlags(&argc, &argv, true); 
 	
-	int iterations = 1000;
-	int chunck_size = 16*1024;
-	int is_server_processing = 1;
-	string file_name = "../../dataset/silesia/nci";
+	int is_server_processing = 0;
+	int iterations = FLAGS_iterations;
+	int chunck_size = FLAGS_chunckSize;
 	int num_threads = FLAGS_threads;
+	string file_name = "../../dataset/silesia/"+FLAGS_fileName;
 
 	NetParam net_param;
 	net_param.numNodes = FLAGS_numNodes;
