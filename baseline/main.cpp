@@ -1,44 +1,20 @@
 #include <fstream>
 #include <iostream>
-
-#include <lz4.h>
 #include <assert.h>
 #include <algorithm>
 #include <gflags/gflags.h>
-#include "libr.hpp"
-
+#include <libr.hpp>
+#include "src/compression.hpp"
 using namespace std;
 std::mutex IO_LOCK;
-
-void set_cpu(thread& t,int cpu_index){
-	cpu_set_t cpuset;
-	CPU_ZERO(&cpuset);
-	CPU_SET(cpu_index, &cpuset);
-	int rc = pthread_setaffinity_np(t.native_handle(),sizeof(cpu_set_t), &cpuset);
-	if (rc != 0) {
-		LOG_E("%-20s : %d","Error calling pthread_setaffinity_np",rc);
-	}
-}
-int compress(char* source_str,char* compressed_str,int input_size){
-	int compressed_size = LZ4_compress_default((const char *)(source_str), compressed_str, input_size, input_size);
-	assert(compressed_size > 0);
-	return compressed_size;
-}
-
-int decompress(char* compressed_str, char* decompressed_str, int compressed_size, int decompressed_capacity){
-	int decompressed_size = LZ4_decompress_safe((const char*)compressed_str, decompressed_str, compressed_size, decompressed_capacity);
-	assert(decompressed_size>0);
-	return decompressed_size;
-}
 
 int init_bufs(int node_id, void** bufs, void* verify_buf, int* compressed_lengths, int num_threads, size_t buf_size, int chunck_size, int is_server_processing, string file_name){
 	LOG_I("[Start Init Buffer] size : %ld, total threads : %d", buf_size, num_threads);
 	for(int i=0;i<num_threads;i++){
-		bufs[i] = myMalloc2MbPage(buf_size);
-		if(node_id == 0){
-			for(int j=0;j<buf_size/sizeof(int);j++){
-				((int**)bufs)[i][j] = 0;
-			}
+		if((0<=i && i<12) || (24<=i && i<36)){//node 0
+			bufs[i] = malloc_2m_numa(buf_size,0);
+		}else{
+			bufs[i] = malloc_2m_numa(buf_size,1);
 		}
 	}
 	int num_chunck = 0;
@@ -84,6 +60,13 @@ int init_bufs(int node_id, void** bufs, void* verify_buf, int* compressed_length
 	return num_chunck;
 }
 void sub_task_server(int thread_index, QpHandler* handler, void* buf, void* verify_buf, size_t buf_size, int num_chunck, int chunck_size, size_t ops, int is_server_processing){
+	while(thread_index != sched_getcpu()){
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));//wait set affinity success
+	}
+	{
+		std::lock_guard<std::mutex> guard(IO_LOCK);
+		LOG_I("Thread [%2d] has been moved to core [%2d]",thread_index,sched_getcpu());
+	}
 	int ne_send;
 	int ne_recv;
 	struct ibv_wc *wc_send = NULL;
@@ -157,12 +140,20 @@ void sub_task_server(int thread_index, QpHandler* handler, void* buf, void* veri
 	}
 	double duration = end_timer.tv_sec-start_timer.tv_sec+1.0*(end_timer.tv_nsec-start_timer.tv_nsec)/1e9;
 	std::lock_guard<std::mutex> guard(IO_LOCK);
-	LOG_I("Server thread [%d] verify buf success",thread_index);
-	LOG_I("Thread : %d, running on CPU : %d",thread_index,sched_getcpu());
-	LOG_I("Time : %.3f s",duration);
-	LOG_I("Speed : %.2f Gb/s",8.0*ops*chunck_size/1024/1024/1024/duration);
+	LOG_I("Thread : [%2d] verify success, Time : [%.3f] s, Speed : [%.2f] Gb/s",thread_index,duration,8.0*ops*chunck_size/1024/1024/1024/duration);
+	if(thread_index != sched_getcpu()){
+		LOG_E("Thread end, index : [%d], running on CPU : [%d]",thread_index,sched_getcpu());
+	}
 }
 void sub_task_client(int thread_index, QpHandler* handler, void* buf, void* verify_buf, int* compressed_lengths, size_t buf_size, int num_chunck, int chunck_size, size_t ops){
+	while(thread_index != sched_getcpu()){
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));//wait set affinity success
+	}
+	{
+		std::lock_guard<std::mutex> guard(IO_LOCK);
+		LOG_I("Thread [%2d] has been moved to core [%2d]",thread_index,sched_getcpu());
+	}
+	
 	int ne_send;
 	int ne_recv;
 	struct ibv_wc *wc_send = NULL;
@@ -222,15 +213,13 @@ void sub_task_client(int thread_index, QpHandler* handler, void* buf, void* veri
 			LOG_E("Client thread [%d] verify buf failed, index:[%d]",thread_index,i);
 			break;
 		}
-		if(i==num_chunck-1){
-			LOG_I("Client thread [%d] verify buf success",thread_index);
-		}
 	}
 	double duration = end_timer.tv_sec-start_timer.tv_sec+1.0*(end_timer.tv_nsec-start_timer.tv_nsec)/1e9;
 	std::lock_guard<std::mutex> guard(IO_LOCK);
-	LOG_I("Thread : %d, running on CPU : %d",thread_index,sched_getcpu());
-	LOG_I("Time : %.3f s",duration);
-	LOG_I("Speed : %.2f Gb/s",8.0*ops*chunck_size/1024/1024/1024/duration);
+	LOG_I("Thread : [%2d] verify success, Time : [%.3f] s, Speed : [%.2f] Gb/s",thread_index,duration,8.0*ops*chunck_size/1024/1024/1024/duration);
+	if(thread_index != sched_getcpu()){
+		LOG_E("Thread end, index : [%d], running on CPU : [%d]",thread_index,sched_getcpu());
+	}
 }
 void compression_benchmark(NetParam &net_param, int num_threads, int iterations, int chunck_size, int is_server_processing, string file_name){
 	int num_cpus = thread::hardware_concurrency();
@@ -241,7 +230,9 @@ void compression_benchmark(NetParam &net_param, int num_threads, int iterations,
 	//init bufs and verify buf
 	size_t buf_size = 512*1024*1024;
 	void** bufs = new void*[num_threads];
-	void* verify_buf = myMalloc2MbPage(buf_size/2);
+	// void* verify_buf = malloc_2m_hugepage(buf_size/2);
+	void* verify_buf;
+	posix_memalign (&verify_buf,4*1024,buf_size/2);
 	int* compressed_lengths = new int[buf_size/2/chunck_size];
 	int num_chunck = init_bufs(net_param.nodeId,bufs,verify_buf,compressed_lengths,num_threads,buf_size,chunck_size,is_server_processing, file_name);
 	size_t ops = size_t(1) * iterations * num_chunck;
@@ -255,9 +246,9 @@ void compression_benchmark(NetParam &net_param, int num_threads, int iterations,
 		qp_handlers[i] = create_qp_rc(net_param,bufs[i],buf_size,info+i);
 	}
 	exchange_data(net_param, (char*)info, sizeof(PingPongInfo)*num_threads);
-	for(int i=0;i<net_param.numNodes*num_threads;i++){
-		print_pingpong_info(info+i);
-	}
+	// for(int i=0;i<net_param.numNodes*num_threads;i++){
+	// 	print_pingpong_info(info+i);
+	// }
 	int my_id = net_param.nodeId;
 	int dest_id = (net_param.nodeId+1)%net_param.numNodes;
 	for(int i=0;i<num_threads;i++){
@@ -280,8 +271,8 @@ void compression_benchmark(NetParam &net_param, int num_threads, int iterations,
 	}
 	clock_gettime(CLOCK_MONOTONIC, &end_timer);
 	double duration = end_timer.tv_sec-start_timer.tv_sec+1.0*(end_timer.tv_nsec-start_timer.tv_nsec)/1e9;
-	LOG_I("Total Time : %.3f s",duration);
-	LOG_I("Total Speed : %.2f Gb/s",8.0*num_threads*ops*chunck_size/1024/1024/1024/duration);
+	LOG_I("Total Time : [%.3f] s",duration);
+	LOG_I("Total Speed : [%.2f] Gb/s",8.0*num_threads*ops*chunck_size/1024/1024/1024/duration);
 }
 
 DEFINE_int32(iterations,			1000,	"iterations");
