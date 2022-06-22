@@ -8,6 +8,10 @@ add_compile_options(-g -o3 -std=c++20 -static)
 
 aux_source_directory(src SRCS)
 
+add_executable(bench_lz4 ${SRCS} bench_lz4.cpp)
+
 add_executable(main ${SRCS} main.cpp)
+
+target_link_libraries(bench_lz4 lz4 r pthread gflags)
 
 target_link_libraries(main lz4 r pthread gflags)
